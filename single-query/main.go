@@ -3,9 +3,11 @@ package main
 import (
 	"context"
 	"fmt"
+	util "github.com/ipfs/go-ipfs-util"
+	kbucket "github.com/libp2p/go-libp2p-kbucket"
+	"github.com/libp2p/go-libp2p-kbucket/keyspace"
 	"time"
 
-	"github.com/libp2p/go-libp2p-core/network"
 	"github.com/libp2p/go-libp2p-core/peer"
 	notif "github.com/libp2p/go-libp2p-routing/notifications"
 
@@ -22,24 +24,6 @@ var bsaddrs = []string{
 	"/ip4/128.199.219.111/tcp/4001/ipfs/QmSoLSafTMBsPKadTEgaXctDQVcqN88CNLHXMkTNwMKPnu",
 	"/ip4/104.236.76.40/tcp/4001/ipfs/QmSoLV4Bbm51jM9C4gDYZQ9Cy3U6aXMJDAbzgu2fzaDs64",
 	"/ip4/178.62.158.247/tcp/4001/ipfs/QmSoLer265NRgSp2LA3dPaeykiS1J6DifTC88f5uVQKNAd",
-}
-
-func computeQueryOverlapScore(peers [][]peer.ID) []int {
-	counts := make(map[peer.ID]int)
-	for _, ps := range peers {
-		for _, p := range ps {
-			counts[p]++
-		}
-	}
-
-	out := make([]int, len(peers))
-	for i, ps := range peers {
-		for _, p := range ps {
-			out[i] += counts[p]
-		}
-	}
-
-	return out
 }
 
 func main() {
@@ -68,13 +52,14 @@ func main() {
 		}
 	}()
 	results := make([][]peer.ID, len(bspis))
-	dials := make([][]peer.AddrInfo, len(bspis))
 	timing := make([]time.Duration, len(bspis))
+
+	const k = "testkey"
 
 	for i := 0; i < len(bspis); i++ {
 		fmt.Println("Running query bench round ", i)
 		start:=time.Now()
-		peers, addrs, err := RunSingleCrawl(ctx, "testkey", bspis[i:i+1])
+		peers, err := RunSingleCrawl(ctx, k, bspis[i:i+1])
 		end := time.Now()
 		if err != nil {
 			fmt.Println("failed to run query: ", err)
@@ -82,58 +67,58 @@ func main() {
 		}
 
 		results[i] = peers
-		dials[i] = addrs
 		timing[i] = end.Sub(start)
 	}
 
-	scores := computeQueryOverlapScore(results)
 	fmt.Println("Results:")
 	for i, r := range results {
-		fmt.Printf("%d: %d %d | time : %s \n", i, len(r), scores[i], timing[i].String())
+		d := printDistances([]byte(k), results[i])
+		fmt.Printf("%d: %d | time : %s | dist : %v \n", i, len(r), timing[i].String(), d)
 	}
 }
 
-func RunSingleCrawl(ctx context.Context, k string, bootstrap []*peer.AddrInfo) ([]peer.ID, []peer.AddrInfo, error) {
+func printDistances(target []byte, peers []peer.ID) []int{
+	t := keyspace.XORKeySpace.Key(target)
+	d := make([]int, len(peers))
+	for i, p := range peers {
+		distb := xor(keyspace.XORKeySpace.Key([]byte(p)).Bytes, t.Bytes)
+		dist := keyspace.ZeroPrefixLen(distb)
+		d[i] = dist
+		fmt.Printf("peer id=%s, distance=%d\n", p, dist)
+	}
+	return d
+}
+
+func xor(a, b kbucket.ID) kbucket.ID {
+	return kbucket.ID(util.XOR(a, b))
+}
+
+func RunSingleCrawl(ctx context.Context, k string, bootstrap []*peer.AddrInfo) ([]peer.ID, error) {
 	ctx, cancel := context.WithTimeout(ctx, time.Minute)
 	defer cancel()
 	h, err := libp2p.New(ctx)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 
 	d, err := dht.New(ctx, h)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 
-	for _, bspi := range bootstrap {
-		if err := h.Connect(ctx, *bspi); err != nil {
-			return nil, nil, err
-		}
+	bspi := bootstrap[0]
+	if err := h.Connect(ctx, *bspi); err != nil {
+		return nil, err
 	}
 
-	// give the dht some breathing room to receive the identify events.
-	time.Sleep(5 * time.Second)
-
-	peers, err := d.GetClosestPeers(ctx, k)
+	peers, err := d.GetClosestPeersSingle(ctx, bspi.ID, k)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 
 	var closest []peer.ID
-	for p := range peers {
-		closest = append(closest, p)
+	for _, p := range peers {
+		closest = append(closest, p.ID)
 	}
-
-	var successDials []peer.AddrInfo
-	for _, c := range h.Network().Conns() {
-		if c.Stat().Direction == network.DirOutbound {
-			successDials = append(successDials, peer.AddrInfo{
-				ID:    c.RemotePeer(),
-				Addrs: []ma.Multiaddr{c.RemoteMultiaddr()},
-			})
-		}
-	}
-
-	return closest, successDials, nil
+	return closest, nil
 }
